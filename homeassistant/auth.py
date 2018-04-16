@@ -71,12 +71,14 @@ class AuthProvider:
         """Return the name of the auth provider."""
         return self.config.get(CONF_NAME, self.DEFAULT_TITLE)
 
+    async def async_credentials(self):
+        """Return all credentials of this provider."""
+        return await self.store.credentials_for_provider(self.type, self.id)
+
+    # Implement by extending class
+
     async def async_initialize(self):
         """Initialize the auth provider."""
-
-    async def async_credentials(self):
-        """Return the existing credentials of this provider."""
-        return await self.store.credentials_for_provider(self.type, self.id)
 
     async def async_credential_flow(self):
         """Return the data flow for logging in with auth provider."""
@@ -85,6 +87,13 @@ class AuthProvider:
     async def async_get_or_create_credentials(self, flow_result):
         """Get credentials based on the flow result."""
         raise NotImplementedError
+
+    async def async_user_meta_for_credentials(self, credentials):
+        """Return extra user metadata for credentials.
+
+        Will be used to populate info when creating a new user.
+        """
+        return {}
 
     @callback
     def async_create_credentials(self, data):
@@ -112,9 +121,11 @@ class AuthProvider:
 class User:
     """A user."""
 
-    id = attr.ib(type=uuid.UUID)
-    is_owner = attr.ib(type=bool)
-    name = attr.ib(type=str)
+    id = attr.ib(type=uuid.UUID, default=None)
+    is_owner = attr.ib(type=bool, default=False)
+    name = attr.ib(type=str, default=None)
+    # List of credentials of a user.
+    credentials = attr.ib(type=list, default=attr.Factory(list))
 
 
 @attr.s(slots=True)
@@ -128,7 +139,6 @@ class Credentials:
     data = attr.ib(type=dict)
 
     id = attr.ib(type=uuid.UUID, default=None)
-    user = attr.ib(type=User, default=None)
 
 
 @attr.s(slots=True)
@@ -144,31 +154,44 @@ class Token:
     """Token to access Home Assistant."""
 
     id = attr.ib(type=uuid.UUID)
-    credentials = attr.ib(type=Credentials)
-    user = attr.ib(type=User)
     access_token = attr.ib(type=str)
     refresh_token = attr.ib(type=str)
+    client_id = attr.ib(type=str)
 
 
 @callback
 def load_auth_provider_module(provider):
     """Load an auth provider."""
     # Stub.
-    from .auth_providers import example
-    return example
+    from .auth_providers import unsecure_example
+    return unsecure_example
 
 
-async def auth_manager_from_config(provider_configs):
+async def auth_manager_from_config(hass, provider_configs):
     """Initialize an auth manager from config."""
     store = AuthStore()
-    providers = await asyncio.gather(auth_provider_from_config(config)
-                                     for config in provider_configs)
-    manager = AuthManager(providers)
+    providers = await asyncio.gather(*[auth_provider_from_config(store, config)
+                                       for config in provider_configs])
+    provider_hash = {}
+    for provider in providers:
+        if provider is None:
+            continue
+
+        key = (provider.type, provider.id)
+
+        if key in provider_hash:
+            _LOGGER.error(
+                'Found duplicate provider: %s. Please add unique IDs if you '
+                'want to have the same provider twice.', key)
+            continue
+
+        provider_hash[key] = provider
+    manager = AuthManager(hass, store, provider_hash)
     await manager.initialize()
     return manager
 
 
-async def auth_provider_from_config(config):
+async def auth_provider_from_config(store, config):
     """Initialize an auth provider from a config."""
     provider_name = config[CONF_TYPE]
     module = load_auth_provider_module(provider_name)
@@ -180,23 +203,28 @@ async def auth_provider_from_config(config):
                       provider_name, humanize_error(config, err))
         return None
 
-    return AUTH_PROVIDERS[provider_name](config)
+    return AUTH_PROVIDERS[provider_name](store, config)
 
 
 class AuthManager:
     """Manage the authentication for Home Assistant."""
 
-    def __init__(self, providers):
+    def __init__(self, hass, store, providers):
         """Initialize the auth manager."""
+        self._store = store
         self._providers = providers
-        self.login_flow =
+        self.login_flow = data_entry_flow.FlowManager(
+            hass, self._async_create_login_flow,
+            self._async_finish_login_flow)
+        self._flow_credentials = {}
 
     async def initialize(self):
         """Initialize the auth manager."""
-        await asyncio.wait(provider.async_initialize() for provider
-                           in self._providers.values())
+        await asyncio.wait([provider.async_initialize() for provider
+                            in self._providers.values()])
 
-    async def async_auth_providers():
+    @callback
+    def async_auth_providers(self):
         """Return a list of available auth providers."""
         return [{
             'name': provider.name,
@@ -204,23 +232,98 @@ class AuthManager:
             'type': provider.type,
         } for provider in self._providers.values()]
 
-    async def
+    async def async_get_or_create_user(self, credentials):
+        """Get or create a user."""
+        return await self._store.async_get_or_create_user(
+            credentials, self._async_get_auth_provider(credentials))
+
+    async def link_user(self, user, credentials):
+        """Link credentials to an existing user."""
+        await self._store.async_link_user(user, credentials)
+
+    async def _async_create_login_flow(self, handler):
+        """Create a login flow."""
+        auth_provider = self._providers[handler]
+        return await auth_provider.async_credential_flow()
+
+    async def _async_finish_login_flow(self, result):
+        """Result of a credential login flow."""
+        provider = self._providers[result['handler']]
+        return await provider.async_get_or_create_credentials(result['data'])
+
+    @callback
+    def _async_get_auth_provider(self, credentials):
+        """Helper to get auth provider from a set of credentials."""
+        auth_provider_key = (credentials.auth_provider_type,
+                             credentials.auth_provider_id)
+        return self._providers[auth_provider_key]
 
 
 class AuthStore:
-    """Holds authentication info."""
+    """Stores authentication info.
+
+    Any mutation to an object should happen inside the auth store.
+    """
 
     def __init__(self):
-        self.credentials = []
+        """Initialize the auth store."""
+        self.users = []
 
     async def credentials_for_provider(self, provider_type, provider_id):
         """Return credentials for specific auth provider type and id."""
-        return [credential for credential in self.credentials
-                if credential.auth_provider_type == provider_type and
-                credential.auth_provider_id == provider_id]
+        result = []
+
+        for user in self.users:
+            for credentials in user.credentials:
+                if (credentials.auth_provider_type == provider_type and
+                        credentials.auth_provider_id == provider_id):
+                    result.append(credentials)
+
+        return result
+
+    async def async_get_or_create_user(self, credentials, auth_provider):
+        """Get or create a new user for given credentials.
+
+        If link_user is passed in, the credentials will be linked to the passed
+        in user if the credentials are new.
+        """
+        # New credentials, store in user
+        if credentials.id is None:
+            info = await auth_provider.async_user_meta_for_credentials(
+                credentials)
+            new_user = User(
+                # Make owner if it's the first user.
+                is_owner=not self.users,
+                name=info.get('name'),
+            )
+            self.users.append(new_user)
+            await self.async_link_user(new_user, credentials)
+            return new_user
+
+        for user in self.users:
+            for creds in user.credentials:
+                if (creds.auth_provider_type == credentials.auth_provider_type
+                        and creds.auth_provider_id == creds.auth_provider_id):
+                    return user
+
+        raise ValueError('We got credentials with ID but found no user')
+
+    async def async_link_user(self, user, credentials):
+        """Add credentials to an existing user."""
+        user.credentials.append(credentials)
+        await self.async_save()
 
     async def async_load(self):
         pass
+        # TODO load from disk
 
     async def async_save(self):
-        pass
+        for user in self.users:
+            if user.id is None:
+                user.id = uuid.uuid4().hex
+
+            for credentials in user.credentials:
+                if credentials.id is None:
+                    credentials.id = uuid.uuid4().hex
+
+        # TODO store to disk

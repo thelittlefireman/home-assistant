@@ -1,13 +1,16 @@
+"""Example auth provider."""
 from collections import OrderedDict
 
 import voluptuous as vol
 
-from homeassistant import auth, data_entry_flow
+from homeassistant import auth
+from homeassistant.helpers.data_entry_flow import SingleSchemaFlow
 
 
 USER_SCHEMA = vol.Schema({
     vol.Required('username'): str,
     vol.Required('password'): str,
+    vol.Optional('name'): str,
 })
 
 
@@ -16,7 +19,7 @@ CONFIG_SCHEMA = auth.AUTH_PROVIDER_SCHEMA.extend({
 })
 
 
-@auth.AUTH_PROVIDERS.register('example')
+@auth.AUTH_PROVIDERS.register('unsecure_example')
 class ExampleAuthProvider(auth.AuthProvider):
     """Example auth provider based on hardcoded usernames and passwords."""
 
@@ -25,7 +28,7 @@ class ExampleAuthProvider(auth.AuthProvider):
         schema = OrderedDict()
         schema['username'] = str
         schema['password'] = str
-        return data_entry_flow.SingleSchemaFlow(vol.Schema(schema))
+        return SingleSchemaFlow(vol.Schema(schema))
 
     async def async_get_or_create_credentials(self, flow_result):
         """Get credentials based on the flow result."""
@@ -48,3 +51,18 @@ class ExampleAuthProvider(auth.AuthProvider):
         return self.async_create_credentials({
             'username': username
         })
+
+    async def async_user_meta_for_credentials(self, credentials):
+        """Return extra user metadata for credentials.
+
+        Will be used to populate info when creating a new user.
+        """
+        username = credentials.data['username']
+
+        for user in self.config['users']:
+            if user['username'] == username:
+                return {
+                    'name': user.get('name')
+                }
+
+        return {}
